@@ -8,9 +8,47 @@ are not available.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+WHISPER_SAMPLE_RATE = 16000
+
+
+def _decode_audio_ffmpeg(path: Path, sample_rate: int = WHISPER_SAMPLE_RATE):
+    """Decode any audio/video file to mono float32 PCM via the ffmpeg CLI.
+
+    faster-whisper's own decoder goes through PyAV, and faster-whisper 1.2.x
+    calls ``av.open(..., metadata_errors=...)`` — a keyword PyAV 15+ removed,
+    so every file-path transcription fails with a TypeError on current PyAV.
+    ffmpeg is already a hard dependency of OpenMontage, so decoding here and
+    handing faster-whisper a numpy array sidesteps PyAV entirely.
+
+    Returns ``None`` when ffmpeg is missing or cannot decode the input; the
+    caller then falls back to passing the path to faster-whisper.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+    try:
+        import numpy as np
+
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error",
+                "-i", str(path),
+                "-f", "f32le", "-ac", "1", "-ar", str(sample_rate),
+                "-",
+            ],
+            capture_output=True,
+            timeout=600,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return None
+        return np.frombuffer(proc.stdout, dtype=np.float32).copy()
+    except Exception:
+        return None
 
 from tools.base_tool import (
     BaseTool,
@@ -153,6 +191,12 @@ class Transcriber(BaseTool):
             # Probing is advisory. CPU remains a safe deterministic baseline.
             pass
 
+        # Decode once with ffmpeg (avoids the PyAV/faster-whisper incompatibility);
+        # fall back to letting faster-whisper open the file itself.
+        decoded_audio = _decode_audio_ffmpeg(input_path)
+        audio_source: Any = decoded_audio if decoded_audio is not None else str(input_path)
+        audio_decoder = "ffmpeg" if decoded_audio is not None else "faster_whisper"
+
         def _transcribe_on(selected_device: str, selected_compute_type: str):
             model = WhisperModel(
                 model_size,
@@ -160,7 +204,7 @@ class Transcriber(BaseTool):
                 compute_type=selected_compute_type,
             )
             segments_iter, transcription_info = model.transcribe(
-                str(input_path),
+                audio_source,
                 language=language,
                 word_timestamps=True,
                 vad_filter=True,
@@ -226,6 +270,7 @@ class Transcriber(BaseTool):
             "device": device,
             "compute_type": compute_type,
             "gpu_fallback_reason": gpu_fallback_reason,
+            "audio_decoder": audio_decoder,
         }
 
         # Write transcript JSON
